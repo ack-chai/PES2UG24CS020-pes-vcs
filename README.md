@@ -1,3 +1,5 @@
+
+
 # Building PES-VCS — A Version Control System from Scratch
 
 **Objective:** Build a local version control system that tracks file changes, stores snapshots efficiently, and supports commit history. Every component maps directly to operating system and filesystem concepts.
@@ -600,3 +602,106 @@ The following questions cover filesystem concepts beyond the implementation scop
 - **Git Internals** (Pro Git book): https://git-scm.com/book/en/v2/Git-Internals-Plumbing-and-Porcelain
 - **Git from the inside out**: https://codewords.recurse.com/issues/two/git-from-the-inside-out
 - **The Git Parable**: https://tom.preston-werner.com/2009/05/19/the-git-parable.html
+
+
+## Phase 5 & 6: Analysis Answers
+
+### Q5.1: How would `pes checkout <branch>` work?
+
+A branch is a file under `.pes/refs/heads/<branch>` containing a commit hash.  
+A checkout operation would do the following:
+
+1. Read `.pes/refs/heads/<branch>` to get the target commit hash.
+2. Resolve the target commit and its root tree from the object store.
+3. Resolve the current commit/tree (from `HEAD`) for comparison.
+4. Update the working directory to match the target tree:
+   - create/update files that differ,
+   - create/remove directories as needed,
+   - remove tracked files that do not exist in target tree.
+5. Rewrite `.pes/index` to match the checked-out snapshot.
+6. Update `.pes/HEAD` to `ref: refs/heads/<branch>`.
+
+Why checkout is complex:
+- It must avoid data loss from local uncommitted changes.
+- It must handle nested trees, deletions, mode changes, and path conflicts.
+- It must ensure failure-safe behavior if interrupted midway.
+
+---
+
+### Q5.2: How to detect dirty working-directory conflicts using only index + object store?
+
+To refuse unsafe checkout:
+
+1. For each tracked path in the index, compare file metadata (`mtime`, `size`) with index entry.
+2. If metadata differs, recompute blob hash of working file and compare with index hash.
+3. Build path->hash maps for:
+   - current branch tree,
+   - target branch tree.
+4. A conflict exists if:
+   - working file differs from index (uncommitted change), and
+   - that path’s content differs between current and target branch trees, and
+   - checkout would overwrite/delete that path.
+5. If any conflict is found, abort checkout and print conflicting paths.
+
+This prevents overwriting unstaged or uncommitted edits.
+
+---
+
+### Q5.3: What happens in detached HEAD? How to recover commits?
+
+Detached HEAD means `.pes/HEAD` contains a commit hash directly, not `ref: ...`.  
+If commits are made in this state:
+
+- New commits are created normally.
+- But no branch ref moves forward.
+- Those commits can become unreachable when switching away, and later may be garbage-collected.
+
+Recovery method:
+1. Identify detached commit hash (from `pes log`/saved output).
+2. Create a branch ref file pointing to it (e.g. `.pes/refs/heads/recover`).
+3. Update `.pes/HEAD` to `ref: refs/heads/recover` (or checkout that branch).
+
+This re-attaches commits to a named branch so they remain reachable.
+
+---
+
+### Q6.1: Algorithm for garbage collection of unreachable objects
+
+Use a mark-and-sweep approach.
+
+**Mark phase**
+1. Start from all refs in `.pes/refs/heads/*` (roots).
+2. For each root commit:
+   - mark commit hash as reachable,
+   - follow parent links recursively/iteratively and mark each commit,
+   - for each commit, mark its root tree and recursively mark subtrees/blobs referenced by tree entries.
+
+**Sweep phase**
+1. Walk all files under `.pes/objects/`.
+2. Convert each object path back to full hash.
+3. Delete objects not present in reachable set.
+
+Data structure:
+- Use a hash set (e.g., hash table) of object IDs for O(1) average membership checks.
+
+Estimate for 100,000 commits and 50 branches:
+- Unique commits visited are usually near ~100,000 (branches share history).
+- Plus associated tree objects (~similar order), and blobs referenced by those trees.
+- Total visited objects is typically a few hundred thousand (repository-dependent), not 50 * 100,000 due to overlap.
+
+---
+
+### Q6.2: Why GC is dangerous during concurrent commit; how Git avoids this
+
+Race condition example:
+1. Commit process writes new blobs/trees/commit object.
+2. Before branch ref is updated, those objects are temporarily unreachable from refs.
+3. Concurrent GC scans refs, does not see new objects as reachable, and deletes them.
+4. Commit process updates ref to commit whose internal objects were deleted.
+5. Repository now has broken references/corruption.
+
+How real Git avoids this:
+- Uses lock coordination and careful object visibility rules.
+- Treats recent/unreferenced objects conservatively (grace periods, reflog reachability).
+- Runs GC in ways that avoid collecting objects that may be created by in-flight operations.
+
